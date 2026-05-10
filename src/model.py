@@ -1,3 +1,163 @@
+
+class MaskTransformer(nn.Module):
+    def __init__(self, num_tokens, code_dim, latent_dim=384, ff_size=1024, num_layers=8,
+                 num_heads=6, dropout=0.1, clip_dim=512, clip_version="ViT-B/32",
+                 cond_drop_prob=0.1, device="cuda", max_seq_len=600):
+        super().__init__()
+        self.nt = num_tokens
+        self.cd = code_dim
+        self.ld = latent_dim
+        self.cdp = cond_drop_prob
+        self.dev = device
+
+        self.mid = num_tokens
+        self.pid = num_tokens + 1
+
+        self.te = nn.Embedding(num_tokens + 2, code_dim)
+        self.inp = InputProcess(code_dim, latent_dim)
+        self.out = OutputProcess(latent_dim, num_tokens)
+        self.pos = PositionalEncoding(latent_dim, dropout, max_seq_len)
+        self.tcontx = TextContextualizer(clip_dim, latent_dim, dropout=dropout)
+        self.tenc = CLIPTextEncoder(clip_version, device, freeze=True)
+        # self.tproj = TextProjector(clip_dim, latent_dim, dropout)
+
+        self.blks = nn.ModuleList([CrossAttentionBlock(latent_dim, num_heads, ff_size, dropout) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(latent_dim)
+
+        self.ns = cos_sched
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Embedding)):
+                m.weight.data.normal_(0, 0.02)
+                if isinstance(m, nn.Linear) and m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, nn.LayerNorm):
+                m.bias.data.zero_()
+                m.weight.data.fill_(1.0)
+
+    def dropc(self, c, force=False):
+        if force: return torch.zeros_like(c)
+        if not self.training or self.cdp == 0: return c
+        bs = c.shape[0]
+        m = torch.bernoulli(torch.full((bs,), self.cdp, device=c.device))
+        return c * (1 - m.view(bs, 1, 1))
+
+    def enct(self, texts):
+        te, tm = self.tenc(texts, tokens=True)   # te: (B, 77, 512), tm: (B, 77)
+        cpad = (tm == 0)                          # True = padding position
+        ce = self.tcontx(te, cpad)               # (B, 77, latent_dim) — contextually enriched
+        return ce, cpad
+
+    def fwd_trans(self, mids, ce, cpad, mpad):
+        B, sl = mids.shape
+        x = self.te(mids)
+        x = self.inp(x)
+        x = self.pos(x)
+        text = ce.permute(1, 0, 2)
+
+        for b in self.blks:
+            x = b(x, text, mpad, cpad)
+
+        x = self.norm(x)
+        return self.out(x)
+
+    def forward(self, motion_ids, texts, m_lens, full_mask_prob=0.5, label_smoothing=0.1):
+        B, sl = motion_ids.shape
+        dev = motion_ids.device
+
+        valid = lens_mask(m_lens, sl)
+        pad = ~valid
+        motion_ids = torch.where(valid, motion_ids, self.pid)
+
+        ce, cpad = self.enct(texts)
+        ce = self.dropc(ce)
+
+        t = uniform((B,), dev)
+        mp = self.ns(t)
+        nm = (sl * mp).round().clamp(min=1)
+
+        full = torch.bernoulli(torch.full((B,), full_mask_prob, device=dev)).bool()
+        nm = torch.where(full, m_lens.float(), nm)
+
+        perm = torch.rand((B, sl), device=dev).argsort(-1)
+        mask = perm < nm.unsqueeze(-1)
+        mask &= valid
+
+        lbl = torch.where(mask, motion_ids, self.mid)
+
+        xids = motion_ids.clone()
+        r10 = torch.bernoulli(torch.full((B, sl), 0.1, device=dev)).bool() & mask
+        xids[r10] = torch.randint(0, self.nt, (B, sl), device=dev)[r10]
+
+        m80 = torch.bernoulli(torch.full((B, sl), 0.8, device=dev)).bool() & mask & ~r10
+        xids[m80] = self.mid
+
+        logits = self.fwd_trans(xids, ce, cpad, pad)
+        logits = logits.permute(0, 2, 1)
+
+        loss = F.cross_entropy(
+            logits.reshape(-1, self.nt),
+            lbl.reshape(-1),
+            ignore_index=self.mid,
+            label_smoothing=label_smoothing
+        )
+
+        pred = logits.argmax(-1)
+        acc = ((pred == motion_ids) & mask).sum().float() / mask.sum().clamp(min=1)
+
+        return loss, pred, acc.item()
+
+    def forward_with_cfg(self, motion_ids, cond_emb, cond_padding_mask, motion_padding_mask, cond_scale=3.0):
+        lc = self.fwd_trans(motion_ids, cond_emb, cond_padding_mask, motion_padding_mask)
+        lu = self.fwd_trans(motion_ids, self.dropc(cond_emb, True), cond_padding_mask, motion_padding_mask)
+        return lu + cond_scale * (lc - lu)
+
+    @torch.no_grad()
+    def generate(self, texts, m_lens, timesteps=10, cond_scale=4.0, temperature=1.0, topk_filter_thres=0.9):
+        self.eval()
+        B = len(texts)
+        dev = next(self.parameters()).device
+        ml = m_lens.max().item()
+
+        valid = lens_mask(m_lens, ml)
+        pad = ~valid
+
+        ce, cpad = self.enct(texts)
+
+        ids = torch.where(pad, self.pid, self.mid)
+        conf = torch.where(pad, 1e5, 0.)
+
+        for s in range(timesteps):
+            t = torch.tensor(s / timesteps, device=dev)
+            p = self.ns(t)
+            nm = (p * m_lens.float()).round().clamp(min=1).long()
+
+            ranks = conf.argsort(1).argsort(1)
+            masked = ranks < nm.unsqueeze(1)
+            ids[masked] = self.mid
+
+            logits = self.forward_with_cfg(ids, ce, cpad, pad, cond_scale)
+            logits = logits.permute(0, 2, 1)
+
+            filt = topk(logits, topk_filter_thres)
+            probs = F.softmax(filt / temperature, -1)
+            samp = torch.multinomial(probs.view(-1, self.nt), 1).view(B, ml)
+
+            ids = torch.where(masked & valid, samp, ids)
+
+            pr = F.softmax(logits, -1)
+            conf = pr.gather(2, samp.unsqueeze(-1)).squeeze(-1)
+            conf[~masked] = 1e5
+
+        ids[pad] = -1
+        return ids
+
+    def params_no_clip(self):
+        return [p for n,p in self.named_parameters() if 'tenc' not in n]
+        
 class TokenDataset(Dataset):
     COMB = "Sentence: {sentence} Signs: {gloss}"
 

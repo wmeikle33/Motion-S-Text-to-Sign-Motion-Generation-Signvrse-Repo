@@ -82,8 +82,9 @@ class MaskTransformer(nn.Module):
         full = torch.bernoulli(torch.full((B,), full_mask_prob, device=dev)).bool()
         nm = torch.where(full, m_lens.float(), nm)
 
-        perm = torch.rand((B, sl), device=dev).argsort(-1)
-        mask = perm < nm.unsqueeze(-1)
+        scores = torch.rand(B, sl, device=dev)
+        scores = scores.masked_fill(~valid, 2.0)
+        mask = scores.argsort(dim=1).argsort(dim=1) < nm[:, None]
         mask &= valid
 
         lbl = torch.where(mask, motion_ids, self.mid)

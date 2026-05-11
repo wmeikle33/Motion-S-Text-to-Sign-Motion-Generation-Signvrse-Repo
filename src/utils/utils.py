@@ -1,4 +1,21 @@
 
+def set_seed(s=42):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+
+
+def make_lr_lambda(warmup_epochs, total_epochs):
+    """Warmup + cosine decay LR schedule (matches mogen)."""
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return max((epoch + 1) / (warmup_epochs + 1), 0.01)
+        progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+        return 0.5 * (1 + np.cos(np.pi * progress))
+    return lr_lambda
+    
 def cos_sched(t):
     return torch.cos(t * math.pi / 2)
 

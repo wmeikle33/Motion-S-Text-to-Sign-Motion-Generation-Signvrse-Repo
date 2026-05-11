@@ -84,3 +84,19 @@ class TextProjector(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class TextContextualizer(nn.Module):
+    def __init__(self, clip_dim=512, latent_dim=384, heads=4, layers=2, dropout=0.1):
+        super().__init__()
+        self.proj = nn.Linear(clip_dim, latent_dim)
+        layer = nn.TransformerEncoderLayer(
+            latent_dim, heads, latent_dim * 4, 
+            dropout, 'gelu', batch_first=True
+        )
+        self.enc = nn.TransformerEncoder(layer, layers)
+    
+    def forward(self, token_embs, pad_mask):
+        # token_embs: (B, 77, 512)  pad_mask: (B, 77) True=ignore
+        x = self.proj(token_embs)              # (B, 77, latent_dim)
+        x = self.enc(x, src_key_padding_mask=pad_mask)
+        return x                               # (B, 77, latent_dim)

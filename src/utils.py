@@ -1,3 +1,21 @@
+
+def cos_sched(t):
+    return torch.cos(t * math.pi / 2)
+
+def uniform(shape, dev):
+    return torch.rand(shape, device=dev)
+
+def topk(logits, th=0.9, d=-1):
+    k = max(1, int((1 - th) * logits.shape[d]))
+    v, i = logits.topk(k, d)
+    out = torch.full_like(logits, float('-inf'))
+    out.scatter_(d, i, v)
+    return out
+
+def lens_mask(lens, ml):
+    dev = lens.device
+    return torch.arange(ml, device=dev).expand(len(lens), ml) < lens.unsqueeze(1)
+    
 class CLIPTextEncoder(nn.Module):
     """
     CLIP text encoder (frozen).

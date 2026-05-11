@@ -6,7 +6,7 @@ The goal of this repo is to build a model that translates English/glossified tex
 
 ```bash
 
-repo/
+repo/src
 ├── models/
 │   ├── mask_transformer.py
 │   ├── blocks.py

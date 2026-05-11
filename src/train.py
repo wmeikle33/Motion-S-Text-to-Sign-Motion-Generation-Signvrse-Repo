@@ -23,6 +23,17 @@ def parse_args():
 def main():
     args = parse_args()
 
+    
+    train_loader = DataLoader(
+        train_ds, batch_size=C['batch_size'], shuffle=True,
+        collate_fn=collate, pin_memory=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=C['batch_size'], shuffle=False,
+        collate_fn=collate, pin_memory=True
+    )
+
+
     for epoch in range(args.epochs):
   
     
